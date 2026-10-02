@@ -1,103 +1,70 @@
-name: Release on version bump
+name: Build unsigned DMG artifact
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build (leave empty to use the branch selected in 'Use workflow from')"
+        required: false
+        type: string
 
 jobs:
-  release:
+  build:
     runs-on: macos-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          ref: ${{ inputs.branch || github.ref_name }}
 
       - name: Get current version
         id: current
-        run: echo "version=$(jq -r '.version' package.json)" >> $GITHUB_OUTPUT
-
-      - name: Get previous version
-        id: previous
-        run: |
-          PREV=$(git show HEAD~1:package.json 2>/dev/null | jq -r '.version // empty' || echo "")
-          echo "version=$PREV" >> $GITHUB_OUTPUT
+        run: echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
-        if: steps.current.outputs.version != steps.previous.outputs.version
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install dependencies
-        if: steps.current.outputs.version != steps.previous.outputs.version
         run: npm ci
 
-      # Two passes on purpose. electron-builder resolves signing identities with
-      # `security find-identity -v`, which only lists *trusted* certificates, so
-      # it cannot use our self-signed one and silently falls back to an ad-hoc
-      # signature. Ad-hoc requirements are cdhash-based and change every build,
-      # which is what drops every user's Accessibility grant on update. So we
-      # build the .app first, sign it ourselves, then wrap the signed app.
+      # Unsigned build: build the .app first so the helper check can run on it,
+      # then package the DMG from that app.
       - name: Build app bundle
-        if: steps.current.outputs.version != steps.previous.outputs.version
         run: npm run build && npx electron-builder --dir
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
       # Ship-blocking. helpers/jiggle-helper is committed and copied verbatim, so a
       # helper compiled with the wrong deployment target ships silently: the app
-      # still launches and only the helper fails to load. Invisible on macOS 26 and
-      # not caught by the signing guards, because the signature is valid either way.
+      # still launches and only the helper fails to load. Invisible on macOS 26.
       - name: Verify helper macOS compatibility
-        if: steps.current.outputs.version != steps.previous.outputs.version
         run: ./scripts/verify-helper-compat.sh release/mac-arm64/AlwaysJiggle.app
 
-      - name: Sign with the project certificate
-        if: steps.current.outputs.version != steps.previous.outputs.version
-        env:
-          SIGN_P12_BASE64: ${{ secrets.SIGNING_CERT_P12_BASE64 }}
-          SIGN_P12_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
-        run: |
-          if [ -z "$SIGN_P12_BASE64" ] || [ -z "$SIGN_P12_PASSWORD" ]; then
-            echo "FATAL: signing secrets are not configured." >&2
-            echo "Set SIGNING_CERT_P12_BASE64 and SIGNING_CERT_PASSWORD in repo secrets." >&2
-            echo "Releasing without them would ship an ad-hoc signature and break" >&2
-            echo "every user's Accessibility grant, so this build stops here." >&2
-            exit 1
-          fi
-          echo "$SIGN_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/signing.p12"
-          SIGN_P12="$RUNNER_TEMP/signing.p12" ./scripts/sign-macos.sh release/mac-arm64/AlwaysJiggle.app
-          rm -f "$RUNNER_TEMP/signing.p12"
-
-      - name: Package DMG from the signed app
-        if: steps.current.outputs.version != steps.previous.outputs.version
+      - name: Package unsigned DMG
         run: npx electron-builder --prepackaged release/mac-arm64/AlwaysJiggle.app --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
-      # Ship-blocking. Checks what is actually inside the DMG, because a silent
-      # fall back to ad-hoc signing is invisible everywhere else.
-      - name: Verify the shipped DMG
-        if: steps.current.outputs.version != steps.previous.outputs.version
-        run: ./scripts/verify-signed-dmg.sh "$(find release -name '*.dmg' | head -1)"
-
-      - name: Create release and attach DMG
-        if: steps.current.outputs.version != steps.previous.outputs.version
-        run: |
-          DMG=$(find release -name "*.dmg" | head -1)
-          VERSION="${{ steps.current.outputs.version }}"
-          # A version with a suffix (1.2.0-rc.1) publishes as a prerelease. The
-          # app polls /releases/latest, which excludes prereleases, so test
-          # builds do not push an update banner to real users.
-          PRERELEASE=""
-          case "$VERSION" in *-*) PRERELEASE="--prerelease" ;; esac
-          gh release create "v$VERSION" \
-            --title "v$VERSION" \
-            --generate-notes \
-            $PRERELEASE \
-            "$DMG"
+      # Artifact names cannot contain "/", so branch names like feature/x are sanitized.
+      - name: Compute artifact name
+        id: meta
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ inputs.branch || github.ref_name }}
+          VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          SAFE_BRANCH=$(echo "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          echo "name=AlwaysJiggle-v${VERSION}-${SAFE_BRANCH}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "dmg=$(find release -name '*.dmg' | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: ${{ steps.meta.outputs.dmg }}
+          if-no-files-found: error
+          retention-days: 14
