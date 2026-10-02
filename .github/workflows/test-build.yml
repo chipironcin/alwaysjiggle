@@ -1,0 +1,70 @@
+name: Build unsigned DMG artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build (leave empty to use the branch selected in 'Use workflow from')"
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || github.ref_name }}
+
+      - name: Get current version
+        id: current
+        run: echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Unsigned build: build the .app first so the helper check can run on it,
+      # then package the DMG from that app.
+      - name: Build app bundle
+        run: npm run build && npx electron-builder --dir
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      # Ship-blocking. helpers/jiggle-helper is committed and copied verbatim, so a
+      # helper compiled with the wrong deployment target ships silently: the app
+      # still launches and only the helper fails to load. Invisible on macOS 26.
+      - name: Verify helper macOS compatibility
+        run: ./scripts/verify-helper-compat.sh release/mac-arm64/AlwaysJiggle.app
+
+      - name: Package unsigned DMG
+        run: npx electron-builder --prepackaged release/mac-arm64/AlwaysJiggle.app --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      # Artifact names cannot contain "/", so branch names like feature/x are sanitized.
+      - name: Compute artifact name
+        id: meta
+        env:
+          BRANCH: ${{ inputs.branch || github.ref_name }}
+          VERSION: ${{ steps.current.outputs.version }}
+        run: |
+          SAFE_BRANCH=$(echo "$BRANCH" | tr -c 'A-Za-z0-9._-' '-')
+          echo "name=AlwaysJiggle-v${VERSION}-${SAFE_BRANCH}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "dmg=$(find release -name '*.dmg' | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: ${{ steps.meta.outputs.dmg }}
+          if-no-files-found: error
+          retention-days: 14
